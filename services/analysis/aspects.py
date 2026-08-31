@@ -1,15 +1,15 @@
 """Aspect extraction service.
 
-This module defines an AspectExtractor class that uses KeyBERT with a
-sentence-transformers embedding model to extract the primary semantic
-aspect discussed in each review, and pairs it with the review's
-existing sentiment.
+This module defines an AspectExtractor class that uses a lightweight,
+deterministic keyphrase-extraction approach (KeyBERT with a
+sentence-transformers embedding model) to identify the primary
+semantic aspect discussed in each valid review, pairing it with the
+review's existing sentiment for downstream theme discovery.
 """
 
 import logging
 
 import pandas as pd
-import torch
 from keybert import KeyBERT
 from sentence_transformers import SentenceTransformer
 
@@ -23,26 +23,22 @@ _TOP_N = 1
 
 
 class AspectExtractor:
-    """Extracts the primary aspect discussed in each review using KeyBERT.
+    """Extracts the primary aspect discussed in each review.
 
-    The embedding model is loaded once at construction time and reused
-    for all subsequent calls to ``extract``.
+    The embedding model is loaded once at construction time and
+    reused for all subsequent calls to ``extract``. The extraction
+    approach is deterministic, making its output suitable for
+    downstream clustering and theme discovery.
     """
 
     def __init__(self) -> None:
         """Initialize the extractor by loading the embedding model."""
-        self._device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
         logger.info(
-            "Loading aspect embedding model '%s' on device '%s'.",
+            "Loading aspect embedding model '%s'.",
             MODEL_NAMES.EMBEDDING_MODEL,
-            self._device,
         )
         try:
-            sentence_model = SentenceTransformer(
-                MODEL_NAMES.EMBEDDING_MODEL, device=str(self._device)
-            )
+            sentence_model = SentenceTransformer(MODEL_NAMES.EMBEDDING_MODEL)
             self._model = KeyBERT(model=sentence_model)
         except Exception:
             logger.exception(
@@ -57,23 +53,28 @@ class AspectExtractor:
         """Extract the primary aspect for each valid row in the DataFrame.
 
         Adds or updates the ``aspect``, ``aspect_sentiment``, and
-        ``aspect_confidence`` columns on the given DataFrame. Rows
-        where ``is_valid`` is False, or where ``normalized_text`` is
-        empty, are assigned ``aspect=None``, ``aspect_sentiment=None``,
-        and ``aspect_confidence=0.0``. The original DataFrame is
-        preserved; no rows are added or removed.
+        ``aspect_confidence`` columns on a copy of the given
+        DataFrame. Rows where ``is_valid`` is False, or where
+        ``normalized_text`` is null, non-string, empty, or
+        whitespace-only, retain ``aspect=None``,
+        ``aspect_sentiment=None``, and ``aspect_confidence=0.0``. All
+        rows and their original order are preserved.
 
         Args:
             df: DataFrame containing ``normalized_text``, ``sentiment``,
-                ``sentiment_confidence``, and ``is_valid`` columns.
+                and ``is_valid`` columns.
 
         Returns:
-            The same DataFrame, with aspect columns added or updated.
+            A copy of the given DataFrame, with aspect columns added
+            or updated for eligible rows.
         """
         df = df.copy()
 
         required_columns = (COLUMNS.NORMALIZED_TEXT, COLUMNS.SENTIMENT)
-        missing_columns = [col for col in required_columns if col not in df.columns]
+        missing_columns = [
+            col for col in required_columns if col not in df.columns
+        ]
+
         if missing_columns:
             logger.error(
                 "Missing required column(s) %s; cannot extract aspects.",
@@ -89,7 +90,9 @@ class AspectExtractor:
         df[COLUMNS.ASPECT_CONFIDENCE] = 0.0
 
         if COLUMNS.IS_VALID in df.columns:
-            eligible_index = df.index[df[COLUMNS.IS_VALID] == True]  # noqa: E712
+            eligible_index = df.index[
+                df[COLUMNS.IS_VALID] == True  # noqa: E712
+            ]
         else:
             logger.warning(
                 "Column '%s' not found; treating all rows as eligible.",
@@ -97,26 +100,38 @@ class AspectExtractor:
             )
             eligible_index = df.index
 
-        eligible_texts = df.loc[eligible_index, COLUMNS.NORMALIZED_TEXT]
+        eligible_texts = df.loc[
+            eligible_index, COLUMNS.NORMALIZED_TEXT
+        ]
+
         non_empty_mask = eligible_texts.apply(
             lambda value: isinstance(value, str) and value.strip() != ""
         )
+
         inference_index = eligible_index[non_empty_mask]
-        texts = df.loc[inference_index, COLUMNS.NORMALIZED_TEXT].tolist()
+
+        texts = df.loc[
+            inference_index, COLUMNS.NORMALIZED_TEXT
+        ].tolist()
+
+        if not texts:
+            logger.info("No eligible rows found for aspect extraction.")
+            return df
 
         aspects: list[str | None] = []
         confidences: list[float] = []
 
         total_batches = (
-            (len(texts) + DEFAULT_BATCH_SIZE - 1) // DEFAULT_BATCH_SIZE
-            if texts
-            else 0
-        )
+            len(texts) + DEFAULT_BATCH_SIZE - 1
+        ) // DEFAULT_BATCH_SIZE
 
         for batch_number, start in enumerate(
-            range(0, len(texts), DEFAULT_BATCH_SIZE), start=1
+            range(0, len(texts), DEFAULT_BATCH_SIZE),
+            start=1,
         ):
-            batch_texts = texts[start:start + DEFAULT_BATCH_SIZE]
+            batch_texts = texts[
+                start:start + DEFAULT_BATCH_SIZE
+            ]
 
             logger.info(
                 "Processing aspect extraction batch %d/%d (%d rows).",
@@ -126,31 +141,45 @@ class AspectExtractor:
             )
 
             batch_results = self._extract_batch(batch_texts)
+
             for aspect, confidence in batch_results:
                 aspects.append(aspect)
                 confidences.append(confidence)
 
-        df.loc[inference_index, COLUMNS.ASPECT] = aspects
-        df.loc[inference_index,COLUMNS.ASPECT_CONFIDENCE ] = confidences
-        df.loc[inference_index, COLUMNS.ASPECT_SENTIMENT] = df.loc[
-            inference_index, COLUMNS.SENTIMENT
-        ]
+        for row_index, aspect, confidence in zip(
+            inference_index,
+            aspects,
+            confidences,
+        ):
+            df.at[row_index, COLUMNS.ASPECT] = aspect
+            df.at[row_index, COLUMNS.ASPECT_CONFIDENCE] = confidence
+            df.at[
+                row_index,
+                COLUMNS.ASPECT_SENTIMENT,
+            ] = df.at[
+                row_index,
+                COLUMNS.SENTIMENT,
+            ]
 
-        logger.info("Aspect extraction complete for %d rows.", len(texts))
+        logger.info(
+            "Aspect extraction complete for %d rows.",
+            len(texts),
+        )
 
         return df
 
     def _extract_batch(
-        self, texts: list[str]
+        self,
+        texts: list[str],
     ) -> list[tuple[str | None, float]]:
-        """Run keyword/aspect extraction on a batch of texts.
+        """Run keyphrase extraction on a batch of texts.
 
         Args:
             texts: List of normalized text strings.
 
         Returns:
             A list of (aspect, aspect_confidence) tuples, one per
-            input text. If no keyword can be extracted for a text,
+            input text. If no keyphrase can be extracted for a text,
             (None, 0.0) is returned for that text.
         """
         results: list[tuple[str | None, float]] = []
@@ -162,9 +191,12 @@ class AspectExtractor:
                     keyphrase_ngram_range=_KEYPHRASE_NGRAM_RANGE,
                     stop_words=_STOP_WORDS,
                     top_n=_TOP_N,
+                    use_mmr=False,
                 )
             except Exception:
-                logger.exception("Failed to extract aspect for a row.")
+                logger.exception(
+                    "Failed to extract aspect for a row."
+                )
                 results.append((None, 0.0))
                 continue
 
@@ -173,6 +205,9 @@ class AspectExtractor:
                 continue
 
             aspect, score = keywords[0]
-            results.append((aspect, float(score)))
+
+            results.append(
+                (aspect, float(score))
+            )
 
         return results
